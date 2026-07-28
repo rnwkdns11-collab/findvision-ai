@@ -2,6 +2,8 @@ import base64
 import json
 import os
 import random
+import re
+from typing import Any
 
 import requests
 import streamlit as st
@@ -14,6 +16,9 @@ st.set_page_config(
 
 TEXT_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast"
 IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+VISION_MODEL = "@cf/moondream/moondream3.1-9B-A2B"
+
+MAX_ATTEMPTS = 3
 
 FIELDS = [
     "name",
@@ -25,10 +30,18 @@ FIELDS = [
     "top",
     "bottom",
     "shoes",
+    "hat",
     "accessories",
     "hair",
     "special_features",
-    "image_prompt_en",
+    "gender_en",
+    "age_en",
+    "body_type_en",
+    "top_en",
+    "bottom_en",
+    "shoes_en",
+    "hat_en",
+    "accessories_en",
 ]
 
 
@@ -40,43 +53,46 @@ def get_secret(name: str) -> str:
     return str(value or os.getenv(name, "")).strip()
 
 
-def cloudflare_request(model: str, payload: dict) -> dict:
+def cf_url(model: str) -> str:
     account_id = get_secret("CLOUDFLARE_ACCOUNT_ID")
-    api_token = get_secret("CLOUDFLARE_API_TOKEN")
+    if not account_id:
+        raise RuntimeError("CLOUDFLARE_ACCOUNT_ID가 없습니다.")
+    return f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 
-    if not account_id or not api_token:
-        raise RuntimeError(
-            "Cloudflare 설정이 없습니다. Streamlit Secrets에 "
-            "CLOUDFLARE_ACCOUNT_ID와 CLOUDFLARE_API_TOKEN을 입력해 주세요."
-        )
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+def cf_headers() -> dict:
+    token = get_secret("CLOUDFLARE_API_TOKEN")
+    if not token:
+        raise RuntimeError("CLOUDFLARE_API_TOKEN이 없습니다.")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
 
+
+def cloudflare_request(model: str, payload: dict, timeout: int = 120) -> Any:
     response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_token}",
-            "Content-Type": "application/json",
-        },
+        cf_url(model),
+        headers=cf_headers(),
         json=payload,
-        timeout=120,
+        timeout=timeout,
     )
 
     try:
         data = response.json()
-    except ValueError:
+    except ValueError as exc:
         raise RuntimeError(
-            f"Cloudflare 응답을 읽을 수 없습니다. HTTP {response.status_code}"
-        )
+            f"Cloudflare 응답을 읽지 못했습니다. HTTP {response.status_code}"
+        ) from exc
 
     if not response.ok or not data.get("success", False):
         errors = data.get("errors") or []
-        message = errors[0].get("message") if errors else str(data)
+        msg = errors[0].get("message") if errors else str(data)
         raise RuntimeError(
-            f"Cloudflare AI 요청 실패 (HTTP {response.status_code}): {message}"
+            f"Cloudflare AI 요청 실패 (HTTP {response.status_code}): {msg}"
         )
 
-    return data["result"]
+    return data.get("result")
 
 
 def extract_features(message: str) -> dict:
@@ -87,155 +103,292 @@ def extract_features(message: str) -> dict:
         "additionalProperties": False,
     }
 
-    payload = {
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "너는 대한민국 실종자 재난문자에서 인상착의를 구조화하는 AI다. "
-                    "반드시 문자에 실제로 적힌 정보만 사용하고, 없는 정보는 빈 문자열로 둔다. "
-                    "얼굴 생김새나 머리 모양처럼 원문에 없는 특징은 추측하지 않는다. "
-                    "image_prompt_en에는 이미지 생성을 위한 영어 문장만 작성한다. "
-                    "성별, 나이, 키, 몸무게, 복장 색상, 신발과 소지품을 원문과 정확히 맞춘다."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "다음 실종 재난문자에서 정보를 추출해줘.\n\n"
-                    f"{message}\n\n"
-                    "image_prompt_en은 다음 형식처럼 작성해: "
-                    "'Korean male, 68 years old, 164 cm tall, 58 kg, "
-                    "wearing a red short-sleeve T-shirt, black long pants, "
-                    "and black Crocs.'"
-                ),
-            },
-        ],
-        "temperature": 0.0,
-        "max_tokens": 700,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": schema,
-        },
-    }
+    system_prompt = """
+너는 대한민국 실종 재난문자에서 인상착의를 추출하는 시스템이다.
 
-    result = cloudflare_request(TEXT_MODEL, payload)
-    parsed = result.get("response", {})
+절대 규칙:
+1. 원문에 실제로 적힌 정보만 추출한다.
+2. 없는 정보는 반드시 빈 문자열("")로 둔다.
+3. 모자/캡/비니가 있으면 반드시 hat에 따로 기록한다.
+4. 상의, 하의, 신발의 색상과 종류를 절대로 바꾸지 않는다.
+5. 영어 필드는 해당 한국어 정보를 정확하게 직역한다.
+6. 예: 검정색 긴바지 -> black long pants
+7. 예: 회색 모자 -> gray hat
+8. 예: 검정색 크록스 -> black Crocs
+"""
+
+    result = cloudflare_request(
+        TEXT_MODEL,
+        {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": f"다음 실종 재난문자를 구조화해줘:\n\n{message}",
+                },
+            ],
+            "temperature": 0.0,
+            "max_tokens": 900,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": schema,
+            },
+        },
+    )
+
+    if isinstance(result, dict):
+        parsed = result.get("response", result)
+    else:
+        parsed = result
 
     if isinstance(parsed, str):
         parsed = json.loads(parsed)
 
     if not isinstance(parsed, dict):
-        raise RuntimeError("AI 분석 결과가 올바른 JSON 형식이 아닙니다.")
+        raise RuntimeError("인상착의 분석 결과가 올바른 형식이 아닙니다.")
 
-    return {key: str(parsed.get(key, "") or "") for key in FIELDS}
-
-
-def build_portrait_prompt(features: dict) -> str:
-    translated = features.get("image_prompt_en", "").strip()
-    if not translated:
-        translated = "A Korean person based only on the provided description."
-
-    return (
-        "Create ONE single centered portrait reference image of this person. "
-        f"Person description: {translated} "
-        "Show head, shoulders, upper torso, and enough clothing to clearly show the top color. "
-        "Neutral front-facing pose, plain white studio background, natural lighting. "
-        "Realistic but clearly AI-generated reference portrait, not an official ID photo. "
-        "Do not invent distinctive facial details that were not provided. "
-        "Do not create text anywhere in the image. "
-        "NO letters, NO Korean, NO Chinese, NO Japanese, NO English, NO numbers, "
-        "NO labels, NO captions, NO poster, NO infographic, NO watermark."
-    )
+    return {key: str(parsed.get(key, "") or "").strip() for key in FIELDS}
 
 
-def generate_portrait(prompt: str) -> bytes:
+def required_items(features: dict) -> list[str]:
+    items = []
+
+    mapping = [
+        ("gender_en", "person"),
+        ("age_en", "age"),
+        ("body_type_en", "body build"),
+        ("top_en", "TOP"),
+        ("bottom_en", "BOTTOM"),
+        ("shoes_en", "SHOES"),
+        ("hat_en", "HAT"),
+        ("accessories_en", "ACCESSORIES"),
+    ]
+
+    for key, label in mapping:
+        value = features.get(key, "").strip()
+        if value:
+            items.append(f"{label}: {value}")
+
+    return items
+
+
+def build_generation_prompt(features: dict, correction: str = "") -> str:
+    must = required_items(features)
+
+    if not must:
+        raise RuntimeError("이미지로 만들 수 있는 인상착의 정보가 없습니다.")
+
+    mandatory = "\n".join(f"- {item}" for item in must)
+
+    correction_text = ""
+    if correction:
+        correction_text = f"""
+THE PREVIOUS IMAGE WAS REJECTED.
+Fix these exact mistakes:
+{correction}
+"""
+
+    return f"""
+Create exactly ONE full-body missing-person appearance reference illustration.
+
+MANDATORY REQUIREMENTS — EVERY ITEM BELOW MUST BE VISIBLE AND CORRECT:
+{mandatory}
+
+CRITICAL RULES:
+- Show the complete body from head to feet.
+- Front-facing natural standing pose.
+- Clothing COLORS must match exactly.
+- Clothing TYPES must match exactly.
+- If a HAT is listed, the hat MUST be clearly visible on the person's head.
+- If no hat is listed, do not invent a hat.
+- Shoes must be clearly visible and match exactly.
+- Accessories must be visible when listed.
+- Do not substitute similar colors.
+- BLACK means BLACK, not white, gray, blue, beige, or navy.
+- Do not replace long pants with shorts.
+- Do not replace Crocs with sneakers.
+- Plain light studio background.
+- No text, letters, numbers, labels, captions, posters, signs, or watermarks.
+- Do not invent distinctive facial features that were not provided.
+
+{correction_text}
+""".strip()
+
+
+def generate_image(prompt: str) -> tuple[bytes, str]:
     result = cloudflare_request(
         IMAGE_MODEL,
         {
             "prompt": prompt,
             "steps": 8,
-            "seed": random.randint(1, 999999999),
+            "seed": random.randint(1, 999_999_999),
         },
     )
 
-    image_b64 = result.get("image")
-    if not image_b64:
-        raise RuntimeError("이미지 데이터가 반환되지 않았습니다.")
+    if not isinstance(result, dict) or not result.get("image"):
+        raise RuntimeError("이미지 생성 결과를 받지 못했습니다.")
 
-    return base64.b64decode(image_b64)
+    b64 = result["image"]
+    return base64.b64decode(b64), b64
+
+
+def extract_text_from_result(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+
+    if isinstance(result, dict):
+        for key in ("response", "result", "text", "answer", "caption"):
+            value = result.get(key)
+            if isinstance(value, str):
+                return value
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+def moondream_query(image_b64: str, prompt: str) -> str:
+    data_uri = f"data:image/jpeg;base64,{image_b64}"
+
+    # Cloudflare's Moondream endpoint supports image query.
+    payloads = [
+        {
+            "task": "query",
+            "image": data_uri,
+            "prompt": prompt,
+            "max_tokens": 500,
+        },
+        {
+            "image": data_uri,
+            "prompt": prompt,
+            "max_tokens": 500,
+        },
+    ]
+
+    last_error = None
+    for payload in payloads:
+        try:
+            result = cloudflare_request(VISION_MODEL, payload)
+            return extract_text_from_result(result)
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"이미지 검수 AI 호출 실패: {last_error}")
+
+
+def parse_json_loose(text: str) -> dict:
+    text = text.strip()
+
+    # ```json ... ``` 제거
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, re.S)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    return {}
+
+
+def verify_image(image_b64: str, features: dict) -> dict:
+    requirements = "\n".join(f"- {item}" for item in required_items(features))
+
+    prompt = f"""
+Inspect this generated full-body person image very carefully.
+
+EXPECTED APPEARANCE:
+{requirements}
+
+Check especially:
+1. top clothing color and type
+2. bottom clothing color and type
+3. shoes color and type
+4. hat presence, type, and color
+5. listed accessories
+6. whether the full body is visible
+
+Be strict. A similar color is NOT a match.
+If BLACK pants are required, white/gray/navy pants are WRONG.
+If a hat is required, no hat is WRONG.
+
+Return JSON ONLY in this exact structure:
+{{
+  "score": 0,
+  "pass": false,
+  "missing": [],
+  "wrong": [],
+  "feedback_en": ""
+}}
+
+score must be 0-100.
+pass can be true only if all clearly visible mandatory clothing, shoes, hat, and accessories match.
+feedback_en must be a short English correction instruction for the image generator.
+""".strip()
+
+    raw = moondream_query(image_b64, prompt)
+    parsed = parse_json_loose(raw)
+
+    try:
+        score = int(parsed.get("score", 0))
+    except Exception:
+        score = 0
+
+    missing = parsed.get("missing", [])
+    wrong = parsed.get("wrong", [])
+
+    if not isinstance(missing, list):
+        missing = [str(missing)]
+    if not isinstance(wrong, list):
+        wrong = [str(wrong)]
+
+    feedback = str(parsed.get("feedback_en", "") or "").strip()
+    passed = bool(parsed.get("pass", False))
+
+    # JSON parsing이 애매한 경우 보수적으로 실패 처리
+    if not parsed:
+        passed = False
+        feedback = (
+            "Regenerate the image and obey every mandatory clothing, hat, shoe, "
+            "color, and accessory requirement exactly."
+        )
+
+    return {
+        "score": max(0, min(score, 100)),
+        "pass": passed and not missing and not wrong,
+        "missing": missing,
+        "wrong": wrong,
+        "feedback_en": feedback,
+        "raw": raw,
+    }
 
 
 def safe(value: str) -> str:
-    value = str(value or "").strip()
     return value if value else "정보 없음"
 
 
-def description_items(features: dict) -> list[tuple[str, str]]:
-    return [
-        ("성별", safe(features.get("gender"))),
-        ("나이", safe(features.get("age"))),
-        ("키", safe(features.get("height"))),
-        ("몸무게", safe(features.get("weight"))),
-        ("체형", safe(features.get("body_type"))),
-        ("상의", safe(features.get("top"))),
-        ("하의", safe(features.get("bottom"))),
-        ("신발", safe(features.get("shoes"))),
-        ("소지품·액세서리", safe(features.get("accessories"))),
-        ("머리 특징", safe(features.get("hair"))),
-        ("기타 특징", safe(features.get("special_features"))),
-    ]
-
-
-st.markdown(
-    """
-    <style>
-    .title-box {
-        text-align: center;
-        padding: 0.2rem 0 1rem 0;
-    }
-    .info-card {
-        background: #f7f8fa;
-        border: 1px solid #e5e7eb;
-        border-radius: 14px;
-        padding: 18px 20px;
-        margin-bottom: 10px;
-        min-height: 92px;
-    }
-    .info-label {
-        font-size: 0.9rem;
-        color: #6b7280;
-        margin-bottom: 6px;
-    }
-    .info-value {
-        font-size: 1.15rem;
-        font-weight: 700;
-        color: #111827;
-        word-break: keep-all;
-    }
-    .notice {
-        background: #fff8db;
-        border-radius: 12px;
-        padding: 14px 18px;
-        margin-bottom: 18px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
+st.title("🔎 FindVision AI")
+st.caption(
+    "실종 재난문자를 분석하고, 생성 이미지가 인상착의와 맞는지 AI가 다시 검사합니다."
 )
 
-st.title("🔎 FindVision AI")
-st.caption("실종 재난문자의 인상착의를 분석하고, 얼굴 참고 이미지와 한국어 인상착의를 함께 표시합니다.")
-
-st.markdown(
-    '<div class="notice">생성된 얼굴은 실제 얼굴 복원이나 신원 확인용이 아닙니다. '
-    '재난문자에 없는 얼굴 정보는 정확히 알 수 없으므로 참고용으로만 사용해야 합니다.</div>',
-    unsafe_allow_html=True,
+st.warning(
+    "이 이미지는 실제 얼굴 복원이 아니라 인상착의 참고용입니다. "
+    "생성형 AI 특성상 100% 일치를 보장할 수 없으며, 앱은 최대 3회 자동 검수·재생성을 수행합니다."
 )
 
 sample = (
-    "진천군 주민인 이광표씨(남,68세)를 찾습니다. "
-    "164cm,58kg, 빨간색 반팔티, 검정색 긴바지, 검정색 크록스"
+    "실종자 남성 68세, 키 164cm, 58kg, "
+    "빨간색 반팔티, 검정색 긴바지, 검정색 크록스, 회색 모자 착용"
 )
 
 message = st.text_area(
@@ -244,70 +397,118 @@ message = st.text_area(
     height=150,
 )
 
-if st.button("AI 분석 및 참고 이미지 생성", type="primary", use_container_width=True):
+if st.button(
+    "AI 분석 → 이미지 생성 → 자동 검수",
+    type="primary",
+    use_container_width=True,
+):
     if not message.strip():
-        st.warning("실종 재난문자 내용을 입력해 주세요.")
+        st.warning("실종 재난문자를 입력해 주세요.")
         st.stop()
 
     try:
-        with st.spinner("재난문자에서 인상착의를 분석하고 있습니다..."):
+        with st.spinner("1/3 인상착의 정보를 정확하게 추출하고 있습니다..."):
             features = extract_features(message.strip())
 
-        prompt = build_portrait_prompt(features)
+        st.subheader("추출된 인상착의")
+        c1, c2 = st.columns(2)
 
-        with st.spinner("얼굴 참고 이미지를 생성하고 있습니다..."):
-            portrait_bytes = generate_portrait(prompt)
+        labels = [
+            ("name", "이름"),
+            ("gender", "성별"),
+            ("age", "나이"),
+            ("height", "키"),
+            ("weight", "몸무게"),
+            ("body_type", "체형"),
+            ("top", "상의"),
+            ("bottom", "하의"),
+            ("shoes", "신발"),
+            ("hat", "모자"),
+            ("accessories", "소지품/액세서리"),
+            ("hair", "머리"),
+            ("special_features", "기타 특징"),
+        ]
 
-        name = safe(features.get("name"))
-        if name == "정보 없음":
-            name = "실종자"
+        for i, (key, label) in enumerate(labels):
+            target = c1 if i < 7 else c2
+            target.write(f"**{label}:** {safe(features.get(key, ''))}")
+
+        best = None
+        correction = ""
+
+        progress = st.progress(0)
+        status = st.empty()
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            status.info(f"{attempt}차 이미지 생성 중...")
+            prompt = build_generation_prompt(features, correction)
+
+            image_bytes, image_b64 = generate_image(prompt)
+
+            progress.progress(int((attempt - 0.5) / MAX_ATTEMPTS * 100))
+            status.info(f"{attempt}차 이미지가 인상착의와 맞는지 Vision AI가 검사 중...")
+
+            verification = verify_image(image_b64, features)
+
+            candidate = {
+                "attempt": attempt,
+                "image": image_bytes,
+                "prompt": prompt,
+                "verification": verification,
+            }
+
+            if best is None or verification["score"] > best["verification"]["score"]:
+                best = candidate
+
+            if verification["pass"]:
+                best = candidate
+                break
+
+            correction = verification["feedback_en"] or (
+                "Regenerate and strictly correct all missing or wrong mandatory items."
+            )
+
+            progress.progress(int(attempt / MAX_ATTEMPTS * 100))
+
+        progress.progress(100)
+        status.empty()
+
+        if best is None:
+            raise RuntimeError("이미지를 생성하지 못했습니다.")
+
+        verdict = best["verification"]
 
         st.divider()
-        st.markdown(
-            f'<div class="title-box"><h1>{name} 인상착의 참고</h1></div>',
-            unsafe_allow_html=True,
+        st.subheader("최종 참고 이미지")
+        st.image(
+            best["image"],
+            caption=f"{best['attempt']}차 생성 결과 · 검수 점수 {verdict['score']}/100",
+            use_container_width=True,
         )
 
-        left, center, right = st.columns([1.05, 1.35, 1.05], gap="large")
-        items = description_items(features)
-
-        with left:
-            for label, value in items[:6]:
-                st.markdown(
-                    f"""
-                    <div class="info-card">
-                        <div class="info-label">{label}</div>
-                        <div class="info-value">{value}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-        with center:
-            st.image(
-                portrait_bytes,
-                caption="AI 생성 얼굴 참고 이미지",
-                use_container_width=True,
+        if verdict["pass"]:
+            st.success(
+                f"자동 검수 통과: {best['attempt']}차 생성 이미지가 필수 인상착의 조건을 충족했습니다."
             )
-            st.info("얼굴 세부 특징이 문자에 없다면 생성된 얼굴은 실제 인물과 다를 수 있습니다.")
+        else:
+            st.warning(
+                "3회 안에 모든 조건을 완전히 통과하지 못해서 가장 높은 점수의 이미지를 표시했습니다. "
+                "실제 사용 전 사람이 한 번 더 확인해야 합니다."
+            )
 
-        with right:
-            for label, value in items[6:]:
-                st.markdown(
-                    f"""
-                    <div class="info-card">
-                        <div class="info-label">{label}</div>
-                        <div class="info-value">{value}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+        if verdict["missing"]:
+            st.write("**누락된 항목:**", ", ".join(map(str, verdict["missing"])))
 
-        with st.expander("원문 재난문자"):
-            st.write(message)
+        if verdict["wrong"]:
+            st.write("**잘못 표현된 항목:**", ", ".join(map(str, verdict["wrong"])))
 
-        with st.expander("이미지 생성용 영어 설명"):
-            st.write(features.get("image_prompt_en", ""))
+        with st.expander("자동 검수 상세"):
+            st.write(f"검수 점수: {verdict['score']}/100")
+            st.write("검수 원문:")
+            st.code(verdict["raw"], language="text")
+
+        with st.expander("최종 이미지 생성 프롬프트"):
+            st.code(best["prompt"], language="text")
 
     except Exception as exc:
         st.error(f"오류가 발생했습니다: {exc}")
