@@ -28,6 +28,7 @@ FIELDS = [
     "accessories",
     "hair",
     "special_features",
+    "image_prompt_en",
 ]
 
 
@@ -49,10 +50,7 @@ def cloudflare_request(model: str, payload: dict) -> dict:
             "CLOUDFLARE_ACCOUNT_ID와 CLOUDFLARE_API_TOKEN을 입력해 주세요."
         )
 
-    url = (
-        f"https://api.cloudflare.com/client/v4/accounts/"
-        f"{account_id}/ai/run/{model}"
-    )
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 
     response = requests.post(
         url,
@@ -84,9 +82,7 @@ def cloudflare_request(model: str, payload: dict) -> dict:
 def extract_features(message: str) -> dict:
     schema = {
         "type": "object",
-        "properties": {
-            key: {"type": "string"} for key in FIELDS
-        },
+        "properties": {key: {"type": "string"} for key in FIELDS},
         "required": FIELDS,
         "additionalProperties": False,
     }
@@ -96,24 +92,27 @@ def extract_features(message: str) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "너는 대한민국 실종자 재난문자에서 인상착의 정보를 "
-                    "정확하게 추출하는 AI 보조 시스템이다. "
-                    "문자에 실제로 적힌 정보만 사용하고, 없는 내용은 절대로 "
-                    "추측하지 말며 빈 문자열로 둔다."
+                    "너는 대한민국 실종자 재난문자에서 인상착의를 구조화하는 AI다. "
+                    "반드시 문자에 실제로 적힌 정보만 사용하고, 없는 정보는 빈 문자열로 둔다. "
+                    "얼굴 생김새나 머리 모양처럼 원문에 없는 특징은 추측하지 않는다. "
+                    "image_prompt_en에는 이미지 생성을 위한 영어 문장만 작성한다. "
+                    "성별, 나이, 키, 몸무게, 복장 색상, 신발과 소지품을 원문과 정확히 맞춘다."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    "다음 실종 재난문자에서 이름, 성별, 나이, 키, 몸무게, "
-                    "체형, 상의, 하의, 신발, 액세서리/소지품, 머리 특징, "
-                    "기타 특징을 추출해줘.\n\n"
-                    f"{message}"
+                    "다음 실종 재난문자에서 정보를 추출해줘.\n\n"
+                    f"{message}\n\n"
+                    "image_prompt_en은 다음 형식처럼 작성해: "
+                    "'Korean male, 68 years old, 164 cm tall, 58 kg, "
+                    "wearing a red short-sleeve T-shirt, black long pants, "
+                    "and black Crocs.'"
                 ),
             },
         ],
-        "temperature": 0.1,
-        "max_tokens": 500,
+        "temperature": 0.0,
+        "max_tokens": 700,
         "response_format": {
             "type": "json_schema",
             "json_schema": schema,
@@ -132,46 +131,30 @@ def extract_features(message: str) -> dict:
     return {key: str(parsed.get(key, "") or "") for key in FIELDS}
 
 
-def build_image_prompt(features: dict) -> str:
-    labels = {
-        "gender": "gender",
-        "age": "age",
-        "height": "height",
-        "weight": "weight",
-        "body_type": "body type",
-        "top": "top clothing",
-        "bottom": "bottom clothing",
-        "shoes": "shoes",
-        "accessories": "accessories or carried items",
-        "hair": "hair",
-        "special_features": "other distinguishing features",
-    }
-
-    facts = []
-    for key, label in labels.items():
-        value = features.get(key, "").strip()
-        if value:
-            facts.append(f"{label}: {value}")
-
-    description = "; ".join(facts) if facts else "limited appearance information"
+def build_portrait_prompt(features: dict) -> str:
+    translated = features.get("image_prompt_en", "").strip()
+    if not translated:
+        translated = "A Korean person based only on the provided description."
 
     return (
-        "Create a neutral full-body reference illustration for a missing-person "
-        "search aid. Use only the explicitly provided description. "
-        f"Description: {description}. "
+        "Create ONE single centered portrait reference image of this person. "
+        f"Person description: {translated} "
+        "Show head, shoulders, upper torso, and enough clothing to clearly show the top color. "
+        "Neutral front-facing pose, plain white studio background, natural lighting. "
+        "Realistic but clearly AI-generated reference portrait, not an official ID photo. "
         "Do not invent distinctive facial details that were not provided. "
-        "Show the person's clothing, body build, shoes, and accessories clearly. "
-        "Simple bright background, front-facing full body, realistic but clearly "
-        "illustrative reference style, no text, no name, no phone number, no address."
+        "Do not create text anywhere in the image. "
+        "NO letters, NO Korean, NO Chinese, NO Japanese, NO English, NO numbers, "
+        "NO labels, NO captions, NO poster, NO infographic, NO watermark."
     )
 
 
-def generate_image(prompt: str) -> bytes:
+def generate_portrait(prompt: str) -> bytes:
     result = cloudflare_request(
         IMAGE_MODEL,
         {
             "prompt": prompt,
-            "steps": 4,
+            "steps": 8,
             "seed": random.randint(1, 999999999),
         },
     )
@@ -183,72 +166,148 @@ def generate_image(prompt: str) -> bytes:
     return base64.b64decode(image_b64)
 
 
-st.title("🔎 FindVision AI")
-st.caption("실종 재난문자의 인상착의를 AI가 구조화하고 참고 이미지로 시각화합니다.")
+def safe(value: str) -> str:
+    value = str(value or "").strip()
+    return value if value else "정보 없음"
 
-st.warning(
-    "생성 이미지는 실제 얼굴 복원이나 신원 확인용이 아닙니다. "
-    "재난문자에 포함된 인상착의를 쉽게 이해하기 위한 참고용 시각화입니다."
+
+def description_items(features: dict) -> list[tuple[str, str]]:
+    return [
+        ("성별", safe(features.get("gender"))),
+        ("나이", safe(features.get("age"))),
+        ("키", safe(features.get("height"))),
+        ("몸무게", safe(features.get("weight"))),
+        ("체형", safe(features.get("body_type"))),
+        ("상의", safe(features.get("top"))),
+        ("하의", safe(features.get("bottom"))),
+        ("신발", safe(features.get("shoes"))),
+        ("소지품·액세서리", safe(features.get("accessories"))),
+        ("머리 특징", safe(features.get("hair"))),
+        ("기타 특징", safe(features.get("special_features"))),
+    ]
+
+
+st.markdown(
+    """
+    <style>
+    .title-box {
+        text-align: center;
+        padding: 0.2rem 0 1rem 0;
+    }
+    .info-card {
+        background: #f7f8fa;
+        border: 1px solid #e5e7eb;
+        border-radius: 14px;
+        padding: 18px 20px;
+        margin-bottom: 10px;
+        min-height: 92px;
+    }
+    .info-label {
+        font-size: 0.9rem;
+        color: #6b7280;
+        margin-bottom: 6px;
+    }
+    .info-value {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: #111827;
+        word-break: keep-all;
+    }
+    .notice {
+        background: #fff8db;
+        border-radius: 12px;
+        padding: 14px 18px;
+        margin-bottom: 18px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("🔎 FindVision AI")
+st.caption("실종 재난문자의 인상착의를 분석하고, 얼굴 참고 이미지와 한국어 인상착의를 함께 표시합니다.")
+
+st.markdown(
+    '<div class="notice">생성된 얼굴은 실제 얼굴 복원이나 신원 확인용이 아닙니다. '
+    '재난문자에 없는 얼굴 정보는 정확히 알 수 없으므로 참고용으로만 사용해야 합니다.</div>',
+    unsafe_allow_html=True,
 )
 
 sample = (
     "진천군 주민인 이광표씨(남,68세)를 찾습니다. "
-    "164cm,58kg, 빨간색반팔티, 검정색 긴바지, 검정색크록스"
+    "164cm,58kg, 빨간색 반팔티, 검정색 긴바지, 검정색 크록스"
 )
 
 message = st.text_area(
     "실종 재난문자 입력",
     value=sample,
-    height=160,
+    height=150,
 )
 
-if st.button("AI 분석 및 이미지 생성", type="primary", use_container_width=True):
+if st.button("AI 분석 및 참고 이미지 생성", type="primary", use_container_width=True):
     if not message.strip():
         st.warning("실종 재난문자 내용을 입력해 주세요.")
         st.stop()
 
     try:
-        with st.spinner("Cloudflare AI가 인상착의를 분석하고 있습니다..."):
+        with st.spinner("재난문자에서 인상착의를 분석하고 있습니다..."):
             features = extract_features(message.strip())
 
-        prompt = build_image_prompt(features)
+        prompt = build_portrait_prompt(features)
 
-        with st.spinner("Cloudflare AI가 참고 이미지를 생성하고 있습니다..."):
-            image_bytes = generate_image(prompt)
+        with st.spinner("얼굴 참고 이미지를 생성하고 있습니다..."):
+            portrait_bytes = generate_portrait(prompt)
 
-        left, right = st.columns([1, 1])
+        name = safe(features.get("name"))
+        if name == "정보 없음":
+            name = "실종자"
+
+        st.divider()
+        st.markdown(
+            f'<div class="title-box"><h1>{name} 인상착의 참고</h1></div>',
+            unsafe_allow_html=True,
+        )
+
+        left, center, right = st.columns([1.05, 1.35, 1.05], gap="large")
+        items = description_items(features)
 
         with left:
-            st.subheader("분석 결과")
-            labels = {
-                "name": "이름",
-                "gender": "성별",
-                "age": "나이",
-                "height": "키",
-                "weight": "몸무게",
-                "body_type": "체형",
-                "top": "상의",
-                "bottom": "하의",
-                "shoes": "신발",
-                "accessories": "소지품/액세서리",
-                "hair": "머리 특징",
-                "special_features": "기타 특징",
-            }
+            for label, value in items[:6]:
+                st.markdown(
+                    f"""
+                    <div class="info-card">
+                        <div class="info-label">{label}</div>
+                        <div class="info-value">{value}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-            for key, label in labels.items():
-                value = features.get(key, "").strip()
-                st.write(f"**{label}:** {value if value else '정보 없음'}")
-
-        with right:
-            st.subheader("참고 이미지")
+        with center:
             st.image(
-                image_bytes,
-                caption="AI 생성 인상착의 참고 이미지",
+                portrait_bytes,
+                caption="AI 생성 얼굴 참고 이미지",
                 use_container_width=True,
             )
+            st.info("얼굴 세부 특징이 문자에 없다면 생성된 얼굴은 실제 인물과 다를 수 있습니다.")
 
-        with st.expander("이미지 생성 프롬프트 보기"):
-            st.code(prompt, language="text")
+        with right:
+            for label, value in items[6:]:
+                st.markdown(
+                    f"""
+                    <div class="info-card">
+                        <div class="info-label">{label}</div>
+                        <div class="info-value">{value}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        with st.expander("원문 재난문자"):
+            st.write(message)
+
+        with st.expander("이미지 생성용 영어 설명"):
+            st.write(features.get("image_prompt_en", ""))
 
     except Exception as exc:
         st.error(f"오류가 발생했습니다: {exc}")
