@@ -60,6 +60,50 @@ HAT_TYPE_MAP = {
 }
 
 
+
+# 재난문자에 외국인/외국 국적이 명시되지 않으면 한국인을 기본값으로 사용한다.
+FOREIGN_NATIONALITY_MAP = {
+    "중국인": "Chinese",
+    "중국 국적": "Chinese",
+    "일본인": "Japanese",
+    "일본 국적": "Japanese",
+    "베트남인": "Vietnamese",
+    "베트남 국적": "Vietnamese",
+    "태국인": "Thai",
+    "태국 국적": "Thai",
+    "필리핀인": "Filipino",
+    "필리핀 국적": "Filipino",
+    "몽골인": "Mongolian",
+    "몽골 국적": "Mongolian",
+    "미국인": "American",
+    "미국 국적": "American",
+    "러시아인": "Russian",
+    "러시아 국적": "Russian",
+    "우즈베키스탄인": "Uzbek",
+    "우즈베키스탄 국적": "Uzbek",
+    "네팔인": "Nepalese",
+    "네팔 국적": "Nepalese",
+    "캄보디아인": "Cambodian",
+    "캄보디아 국적": "Cambodian",
+}
+
+def get_subject_origin(message: str) -> tuple[str, str]:
+    """
+    반환값: (화면 표시용 한국어, 이미지 프롬프트용 영어)
+    외국 국적이 명시되지 않으면 기본값은 한국인이다.
+    """
+    normalized = message.replace(" ", "")
+
+    for keyword, english in FOREIGN_NATIONALITY_MAP.items():
+        if keyword.replace(" ", "") in normalized:
+            return keyword.replace(" 국적", ""), english
+
+    if "외국인" in normalized or "외국국적" in normalized:
+        return "외국인(국적 불명)", "non-Korean foreign person, nationality unspecified"
+
+    return "한국인", "Korean"
+
+
 def get_secret(name: str) -> str:
     try:
         value = st.secrets.get(name, "")
@@ -207,7 +251,7 @@ def required_items(features: dict) -> list[str]:
     return items
 
 
-def build_generation_prompt(features: dict, correction: str = "") -> str:
+def build_generation_prompt(features: dict, subject_origin_en: str, correction: str = "") -> str:
     must = required_items(features)
 
     if not must:
@@ -238,8 +282,11 @@ Create exactly ONE full-body missing-person appearance reference illustration.
 
 MANDATORY REQUIREMENTS — EVERY ITEM BELOW MUST BE VISIBLE AND CORRECT:
 {mandatory}
+- PERSON ORIGIN/APPEARANCE DEFAULT: {subject_origin_en}
 
 CRITICAL RULES:
+- Unless the disaster message explicitly states a foreign nationality or says the person is foreign, depict the person as Korean.
+- Do not randomly change the person's nationality/ethnic appearance.
 - Show the complete body from head to feet.
 - Front-facing natural standing pose.
 - Clothing COLORS must match exactly.
@@ -436,7 +483,8 @@ def safe(value: str) -> str:
 
 st.title("🔎 FindVision AI")
 st.caption(
-    "실종 재난문자를 분석하고, 생성 이미지가 인상착의와 맞는지 AI가 다시 검사합니다."
+    "실종 재난문자를 분석하고, 생성 이미지가 인상착의와 맞는지 AI가 다시 검사합니다. "
+    "외국인이라고 명시되지 않으면 한국인을 기본 인물로 생성합니다."
 )
 
 st.warning(
@@ -467,8 +515,10 @@ if st.button(
     try:
         with st.spinner("1/3 인상착의 정보를 정확하게 추출하고 있습니다..."):
             features = extract_features(message.strip())
+            subject_origin_kr, subject_origin_en = get_subject_origin(message.strip())
 
         st.subheader("추출된 인상착의")
+        st.write(f"**기본 인물 설정:** {subject_origin_kr}")
         c1, c2 = st.columns(2)
 
         labels = [
@@ -501,7 +551,7 @@ if st.button(
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             status.info(f"{attempt}차 이미지 생성 중...")
-            prompt = build_generation_prompt(features, correction)
+            prompt = build_generation_prompt(features, subject_origin_en, correction)
 
             image_bytes, image_b64 = generate_image(prompt)
 
