@@ -31,6 +31,8 @@ FIELDS = [
     "bottom",
     "shoes",
     "hat",
+    "hat_type",
+    "hat_color",
     "accessories",
     "hair",
     "special_features",
@@ -41,8 +43,21 @@ FIELDS = [
     "bottom_en",
     "shoes_en",
     "hat_en",
+    "hat_type_en",
+    "hat_color_en",
     "accessories_en",
 ]
+
+HAT_TYPE_MAP = {
+    "캡모자": "baseball cap",
+    "야구모자": "baseball cap",
+    "캡": "baseball cap",
+    "비니": "beanie",
+    "벙거지": "bucket hat",
+    "버킷햇": "bucket hat",
+    "챙모자": "brimmed hat",
+    "모자": "hat",
+}
 
 
 def get_secret(name: str) -> str:
@@ -109,12 +124,16 @@ def extract_features(message: str) -> dict:
 절대 규칙:
 1. 원문에 실제로 적힌 정보만 추출한다.
 2. 없는 정보는 반드시 빈 문자열("")로 둔다.
-3. 모자/캡/비니가 있으면 반드시 hat에 따로 기록한다.
-4. 상의, 하의, 신발의 색상과 종류를 절대로 바꾸지 않는다.
-5. 영어 필드는 해당 한국어 정보를 정확하게 직역한다.
-6. 예: 검정색 긴바지 -> black long pants
-7. 예: 회색 모자 -> gray hat
-8. 예: 검정색 크록스 -> black Crocs
+3. 모자가 있으면 hat에 기록하고, 종류가 있으면 hat_type에 기록한다.
+4. 예시: 캡모자/야구모자/캡 -> hat_type은 "캡모자"
+5. 예시: 비니 -> hat_type은 "비니"
+6. 예시: 벙거지/버킷햇 -> hat_type은 "벙거지"
+7. hat_color에는 모자 색상을 적는다.
+8. 상의, 하의, 신발의 색상과 종류를 절대로 바꾸지 않는다.
+9. 영어 필드는 한국어 필드를 정확히 번역한다.
+10. 검정색 긴바지 -> black long pants
+11. 회색 캡모자 -> gray baseball cap
+12. 검정색 크록스 -> black Crocs
 """
 
     result = cloudflare_request(
@@ -128,7 +147,7 @@ def extract_features(message: str) -> dict:
                 },
             ],
             "temperature": 0.0,
-            "max_tokens": 900,
+            "max_tokens": 1200,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": schema,
@@ -147,7 +166,22 @@ def extract_features(message: str) -> dict:
     if not isinstance(parsed, dict):
         raise RuntimeError("인상착의 분석 결과가 올바른 형식이 아닙니다.")
 
-    return {key: str(parsed.get(key, "") or "").strip() for key in FIELDS}
+    cleaned = {key: str(parsed.get(key, "") or "").strip() for key in FIELDS}
+
+    if cleaned["hat"] and not cleaned["hat_type"]:
+        if "캡" in cleaned["hat"] or "야구모자" in cleaned["hat"]:
+            cleaned["hat_type"] = "캡모자"
+        elif "비니" in cleaned["hat"]:
+            cleaned["hat_type"] = "비니"
+        elif "벙거지" in cleaned["hat"] or "버킷햇" in cleaned["hat"]:
+            cleaned["hat_type"] = "벙거지"
+        elif "모자" in cleaned["hat"]:
+            cleaned["hat_type"] = "모자"
+
+    if cleaned["hat_type"] and not cleaned["hat_type_en"]:
+        cleaned["hat_type_en"] = HAT_TYPE_MAP.get(cleaned["hat_type"], "hat")
+
+    return cleaned
 
 
 def required_items(features: dict) -> list[str]:
@@ -161,6 +195,7 @@ def required_items(features: dict) -> list[str]:
         ("bottom_en", "BOTTOM"),
         ("shoes_en", "SHOES"),
         ("hat_en", "HAT"),
+        ("hat_type_en", "HAT_TYPE"),
         ("accessories_en", "ACCESSORIES"),
     ]
 
@@ -180,12 +215,22 @@ def build_generation_prompt(features: dict, correction: str = "") -> str:
 
     mandatory = "\n".join(f"- {item}" for item in must)
 
+    hat_rule = ""
+    if features.get("hat_type"):
+        hat_type_kr = features["hat_type"]
+        hat_type_en = features.get("hat_type_en") or "hat"
+        hat_rule = (
+            f"- REQUIRED HAT TYPE: {hat_type_en}. "
+            f"A generic different hat is wrong. "
+            f"If the required type is {hat_type_en}, do not use another hat type.\n"
+        )
+
     correction_text = ""
     if correction:
         correction_text = f"""
-THE PREVIOUS IMAGE WAS REJECTED.
-Fix these exact mistakes:
+이전 이미지에서 잘못된 점:
 {correction}
+위 문제만 정확히 수정하고, 이미 맞았던 요소는 유지해라.
 """
 
     return f"""
@@ -199,16 +244,18 @@ CRITICAL RULES:
 - Front-facing natural standing pose.
 - Clothing COLORS must match exactly.
 - Clothing TYPES must match exactly.
-- If a HAT is listed, the hat MUST be clearly visible on the person's head.
-- If no hat is listed, do not invent a hat.
-- Shoes must be clearly visible and match exactly.
+- If a hat is listed, the hat MUST be clearly visible on the person's head.
+{hat_rule}- Shoes must be clearly visible and match exactly.
 - Accessories must be visible when listed.
 - Do not substitute similar colors.
 - BLACK means BLACK, not white, gray, blue, beige, or navy.
 - Do not replace long pants with shorts.
 - Do not replace Crocs with sneakers.
 - Plain light studio background.
-- No text, letters, numbers, labels, captions, posters, signs, or watermarks.
+- Image must contain NO TEXT at all.
+- No Korean letters, no English letters, no Chinese letters, no Japanese letters.
+- No labels, no captions, no posters, no signs, no watermarks, no symbols, no numbers.
+- Only a single person should appear.
 - Do not invent distinctive facial features that were not provided.
 
 {correction_text}
@@ -248,18 +295,17 @@ def extract_text_from_result(result: Any) -> str:
 def moondream_query(image_b64: str, prompt: str) -> str:
     data_uri = f"data:image/jpeg;base64,{image_b64}"
 
-    # Cloudflare's Moondream endpoint supports image query.
     payloads = [
         {
             "task": "query",
             "image": data_uri,
             "prompt": prompt,
-            "max_tokens": 500,
+            "max_tokens": 700,
         },
         {
             "image": data_uri,
             "prompt": prompt,
-            "max_tokens": 500,
+            "max_tokens": 700,
         },
     ]
 
@@ -276,8 +322,6 @@ def moondream_query(image_b64: str, prompt: str) -> str:
 
 def parse_json_loose(text: str) -> dict:
     text = text.strip()
-
-    # ```json ... ``` 제거
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
     text = re.sub(r"\s*```$", "", text)
 
@@ -302,24 +346,33 @@ def parse_json_loose(text: str) -> dict:
 
 def verify_image(image_b64: str, features: dict) -> dict:
     requirements = "\n".join(f"- {item}" for item in required_items(features))
+    hat_note = ""
+    if features.get("hat_type_en"):
+        hat_note = (
+            f"\nThe required hat type is exactly: {features['hat_type_en']}."
+            f"\nA generic hat is NOT enough."
+        )
 
     prompt = f"""
 Inspect this generated full-body person image very carefully.
 
 EXPECTED APPEARANCE:
 {requirements}
+{hat_note}
 
 Check especially:
 1. top clothing color and type
 2. bottom clothing color and type
 3. shoes color and type
-4. hat presence, type, and color
+4. hat presence, hat type, and hat color
 5. listed accessories
 6. whether the full body is visible
+7. whether ANY text exists inside the image
 
-Be strict. A similar color is NOT a match.
-If BLACK pants are required, white/gray/navy pants are WRONG.
-If a hat is required, no hat is WRONG.
+Be strict.
+If black pants are required, white/gray/navy pants are wrong.
+If a gray baseball cap is required, a beanie or a generic hat is wrong.
+If there is any text in the image, that is wrong.
 
 Return JSON ONLY in this exact structure:
 {{
@@ -327,11 +380,12 @@ Return JSON ONLY in this exact structure:
   "pass": false,
   "missing": [],
   "wrong": [],
+  "has_text": false,
   "feedback_en": ""
 }}
 
 score must be 0-100.
-pass can be true only if all clearly visible mandatory clothing, shoes, hat, and accessories match.
+pass can be true only if all mandatory items match and has_text is false.
 feedback_en must be a short English correction instruction for the image generator.
 """.strip()
 
@@ -351,22 +405,26 @@ feedback_en must be a short English correction instruction for the image generat
     if not isinstance(wrong, list):
         wrong = [str(wrong)]
 
+    has_text = bool(parsed.get("has_text", False))
     feedback = str(parsed.get("feedback_en", "") or "").strip()
     passed = bool(parsed.get("pass", False))
 
-    # JSON parsing이 애매한 경우 보수적으로 실패 처리
+    if has_text:
+        wrong.append("이미지 안에 글자가 들어감")
+
     if not parsed:
         passed = False
         feedback = (
             "Regenerate the image and obey every mandatory clothing, hat, shoe, "
-            "color, and accessory requirement exactly."
+            "color, and accessory requirement exactly. Ensure absolutely no text is present."
         )
 
     return {
         "score": max(0, min(score, 100)),
-        "pass": passed and not missing and not wrong,
+        "pass": passed and not missing and not wrong and not has_text,
         "missing": missing,
         "wrong": wrong,
+        "has_text": has_text,
         "feedback_en": feedback,
         "raw": raw,
     }
@@ -388,7 +446,7 @@ st.warning(
 
 sample = (
     "실종자 남성 68세, 키 164cm, 58kg, "
-    "빨간색 반팔티, 검정색 긴바지, 검정색 크록스, 회색 모자 착용"
+    "빨간색 반팔티, 검정색 긴바지, 검정색 크록스, 회색 캡모자 착용"
 )
 
 message = st.text_area(
@@ -424,13 +482,15 @@ if st.button(
             ("bottom", "하의"),
             ("shoes", "신발"),
             ("hat", "모자"),
+            ("hat_type", "모자 종류"),
+            ("hat_color", "모자 색상"),
             ("accessories", "소지품/액세서리"),
             ("hair", "머리"),
             ("special_features", "기타 특징"),
         ]
 
         for i, (key, label) in enumerate(labels):
-            target = c1 if i < 7 else c2
+            target = c1 if i < 8 else c2
             target.write(f"**{label}:** {safe(features.get(key, ''))}")
 
         best = None
@@ -446,7 +506,7 @@ if st.button(
             image_bytes, image_b64 = generate_image(prompt)
 
             progress.progress(int((attempt - 0.5) / MAX_ATTEMPTS * 100))
-            status.info(f"{attempt}차 이미지가 인상착의와 맞는지 Vision AI가 검사 중...")
+            status.info(f"{attempt}차 이미지가 인상착의와 맞는지 검사 중...")
 
             verification = verify_image(image_b64, features)
 
@@ -465,7 +525,8 @@ if st.button(
                 break
 
             correction = verification["feedback_en"] or (
-                "Regenerate and strictly correct all missing or wrong mandatory items."
+                "Regenerate and strictly correct all missing or wrong mandatory items. "
+                "Also ensure there is absolutely no text inside the image."
             )
 
             progress.progress(int(attempt / MAX_ATTEMPTS * 100))
@@ -502,13 +563,11 @@ if st.button(
         if verdict["wrong"]:
             st.write("**잘못 표현된 항목:**", ", ".join(map(str, verdict["wrong"])))
 
-        with st.expander("자동 검수 상세"):
-            st.write(f"검수 점수: {verdict['score']}/100")
-            st.write("검수 원문:")
-            st.code(verdict["raw"], language="text")
+        if verdict["has_text"]:
+            st.error("이미지 안에 글자가 들어간 것으로 판단되어 재생성 대상이 되었습니다.")
 
-        with st.expander("최종 이미지 생성 프롬프트"):
-            st.code(best["prompt"], language="text")
+        with st.expander("원문 재난문자 보기"):
+            st.write(message)
 
     except Exception as exc:
         st.error(f"오류가 발생했습니다: {exc}")
