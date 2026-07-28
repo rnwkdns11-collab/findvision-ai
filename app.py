@@ -27,6 +27,8 @@ FIELDS = [
     "height",
     "weight",
     "body_type",
+    "skin_tone",
+    "hair_texture",
     "top",
     "bottom",
     "shoes",
@@ -39,6 +41,8 @@ FIELDS = [
     "gender_en",
     "age_en",
     "body_type_en",
+    "skin_tone_en",
+    "hair_texture_en",
     "top_en",
     "bottom_en",
     "shoes_en",
@@ -148,7 +152,8 @@ def cloudflare_request(model: str, payload: dict, timeout: int = 120) -> Any:
         errors = data.get("errors") or []
         msg = errors[0].get("message") if errors else str(data)
         raise RuntimeError(
-            f"Cloudflare AI 요청 실패 (HTTP {response.status_code}): {msg}"
+            f"Cloudflare AI 요청 실패 [{model}] "
+            f"(HTTP {response.status_code}): {msg}"
         )
 
     return data.get("result")
@@ -173,11 +178,20 @@ def extract_features(message: str) -> dict:
 5. 예시: 비니 -> hat_type은 "비니"
 6. 예시: 벙거지/버킷햇 -> hat_type은 "벙거지"
 7. hat_color에는 모자 색상을 적는다.
-8. 상의, 하의, 신발의 색상과 종류를 절대로 바꾸지 않는다.
-9. 영어 필드는 한국어 필드를 정확히 번역한다.
-10. 검정색 긴바지 -> black long pants
-11. 회색 캡모자 -> gray baseball cap
-12. 검정색 크록스 -> black Crocs
+8. skin_tone에는 원문에 명시된 피부색이나 피부 톤만 기록한다.
+9. 예시: 피부가 어두움/짙은 피부 -> "어두운 피부"
+10. 예시: 피부가 밝음 -> "밝은 피부"
+11. hair_texture에는 원문에 명시된 머리 형태만 기록한다.
+12. 예시: 곱슬머리/곱슬 -> "곱슬머리"
+13. 예시: 직모/생머리 -> "직모"
+14. 피부색이나 머리 형태만 보고 국적을 추정하지 않는다.
+15. 상의, 하의, 신발의 색상과 종류를 절대로 바꾸지 않는다.
+16. 영어 필드는 한국어 필드를 정확히 번역한다.
+17. 어두운 피부 -> dark skin tone
+18. 곱슬머리 -> curly hair
+19. 검정색 긴바지 -> black long pants
+20. 회색 캡모자 -> gray baseball cap
+21. 검정색 크록스 -> black Crocs
 """
 
     result = cloudflare_request(
@@ -235,6 +249,8 @@ def required_items(features: dict) -> list[str]:
         ("gender_en", "person"),
         ("age_en", "age"),
         ("body_type_en", "body build"),
+        ("skin_tone_en", "SKIN TONE"),
+        ("hair_texture_en", "HAIR TEXTURE"),
         ("top_en", "TOP"),
         ("bottom_en", "BOTTOM"),
         ("shoes_en", "SHOES"),
@@ -289,6 +305,10 @@ CRITICAL RULES:
 - Do not randomly change the person's nationality/ethnic appearance.
 - Show the complete body from head to feet.
 - Front-facing natural standing pose.
+- Skin tone must match the description exactly when it is provided.
+- Hair texture must match exactly when it is provided.
+- Curly hair must visibly look curly, not straight or slightly wavy.
+- Do not infer or change nationality based only on skin tone or hair texture.
 - Clothing COLORS must match exactly.
 - Clothing TYPES must match exactly.
 - If a hat is listed, the hat MUST be clearly visible on the person's head.
@@ -310,6 +330,9 @@ CRITICAL RULES:
 
 
 def generate_image(prompt: str) -> tuple[bytes, str]:
+    # FLUX.1 schnell의 prompt 최대 길이는 2048자이므로 안전하게 제한한다.
+    prompt = prompt[:2000]
+
     result = cloudflare_request(
         IMAGE_MODEL,
         {
@@ -340,31 +363,23 @@ def extract_text_from_result(result: Any) -> str:
 
 
 def moondream_query(image_b64: str, prompt: str) -> str:
+    """
+    Cloudflare Workers AI Moondream 3.1 공식 입력 형식:
+    task=query, image=<base64 data URI>, question=<질문>
+    """
     data_uri = f"data:image/jpeg;base64,{image_b64}"
 
-    payloads = [
-        {
-            "task": "query",
-            "image": data_uri,
-            "prompt": prompt,
-            "max_tokens": 700,
-        },
-        {
-            "image": data_uri,
-            "prompt": prompt,
-            "max_tokens": 700,
-        },
-    ]
+    payload = {
+        "task": "query",
+        "image": data_uri,
+        "question": prompt,
+        "reasoning": False,
+        "max_tokens": 700,
+        "stream": False,
+    }
 
-    last_error = None
-    for payload in payloads:
-        try:
-            result = cloudflare_request(VISION_MODEL, payload)
-            return extract_text_from_result(result)
-        except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(f"이미지 검수 AI 호출 실패: {last_error}")
+    result = cloudflare_request(VISION_MODEL, payload)
+    return extract_text_from_result(result)
 
 
 def parse_json_loose(text: str) -> dict:
@@ -408,16 +423,20 @@ EXPECTED APPEARANCE:
 {hat_note}
 
 Check especially:
-1. top clothing color and type
-2. bottom clothing color and type
-3. shoes color and type
-4. hat presence, hat type, and hat color
-5. listed accessories
-6. whether the full body is visible
-7. whether ANY text exists inside the image
+1. skin tone, if specified
+2. hair texture, if specified
+3. top clothing color and type
+4. bottom clothing color and type
+5. shoes color and type
+6. hat presence, hat type, and hat color
+7. listed accessories
+8. whether the full body is visible
+9. whether ANY text exists inside the image
 
 Be strict.
 If black pants are required, white/gray/navy pants are wrong.
+If dark skin is required, a clearly light skin tone is wrong.
+If curly hair is required, straight or only slightly wavy hair is wrong.
 If a gray baseball cap is required, a beanie or a generic hat is wrong.
 If there is any text in the image, that is wrong.
 
@@ -484,7 +503,8 @@ def safe(value: str) -> str:
 st.title("🔎 FindVision AI")
 st.caption(
     "실종 재난문자를 분석하고, 생성 이미지가 인상착의와 맞는지 AI가 다시 검사합니다. "
-    "외국인이라고 명시되지 않으면 한국인을 기본 인물로 생성합니다."
+    "외국인이라고 명시되지 않으면 한국인을 기본 인물로 생성하며, "
+    "피부 특징과 머리 형태는 국적과 별개로 원문대로 반영합니다."
 )
 
 st.warning(
@@ -493,7 +513,7 @@ st.warning(
 )
 
 sample = (
-    "실종자 남성 68세, 키 164cm, 58kg, "
+    "실종자 남성 68세, 키 164cm, 58kg, 어두운 피부, 짧은 곱슬머리, "
     "빨간색 반팔티, 검정색 긴바지, 검정색 크록스, 회색 캡모자 착용"
 )
 
@@ -528,6 +548,8 @@ if st.button(
             ("height", "키"),
             ("weight", "몸무게"),
             ("body_type", "체형"),
+            ("skin_tone", "피부 특징"),
+            ("hair_texture", "머리 형태"),
             ("top", "상의"),
             ("bottom", "하의"),
             ("shoes", "신발"),
@@ -540,7 +562,7 @@ if st.button(
         ]
 
         for i, (key, label) in enumerate(labels):
-            target = c1 if i < 8 else c2
+            target = c1 if i < 9 else c2
             target.write(f"**{label}:** {safe(features.get(key, ''))}")
 
         best = None
