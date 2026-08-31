@@ -1,7 +1,6 @@
 import base64
 import json
 import os
-import random
 import re
 from typing import Any
 
@@ -372,7 +371,6 @@ def generate_image(prompt: str) -> tuple[bytes, str]:
         {
             "prompt": prompt,
             "steps": 8,
-            "seed": random.randint(1, 999_999_999),
         },
     )
 
